@@ -6,25 +6,66 @@ Created on 12/02/2014
 This is supposed to run the whole idea
 '''
 
+MAKE_PLOTS = False
+VERBOSE = True
+
 from hmf import MassFunction
 import numpy as np
 from scipy.integrate import cumtrapz
-from scipy.interpolate import UnivariateSpline as spline
+from scipy.interpolate import InterpolatedUnivariateSpline as spline
+import sys
 
-def fast(filename, cell_size, **mf_kwargs):
+if MAKE_PLOTS:
+    import matplotlib.pyplot as plt
+
+def fast(filename, cell_size=1, frac_mass_in_halos=1.0, **mf_kwargs):
 
     # Read in the dm particle possitions from GADGET file
-    dm_pos, mpart = _get_gadget(filename)
+    if VERBOSE:
+        print "READING GADGET FILE..."
+    dm_pos, header = _get_gadget(filename)
+    mpart = header['massarr'][1] * 1e10
+    boxsize = header['boxsize']
 
+    if type(cell_size) == int:
+        cell_size = boxsize / cell_size
     # Assign particles to a grid. At this stage, don't get rid of original pos
-    grid, edges = _make_grid(dm_pos, cell_size)
+    if VERBOSE:
+        print "CREATING GRID CELLS..."
+    grid, cell_size = _make_grid(dm_pos, boxsize, cell_size)
     grid *= mpart
 
-    cdf, icdf = prepare_mf(mpart, grid, mf_kwargs)
+    # Update mf_kwargs with the things we know are true
+    mf_kwargs.update({"z":header['z'],
+                      "omegav":header['omegav'],
+                      'h':header['h'],
+                      'omegam':header['omegam']})
 
-    halomasses = choose_halo_masses(cdf, icdf, mpart, grid)
+    if VERBOSE:
+        print "PREPARING THEORETICAL MASS FUNCTION..."
+    cdf, icdf, M, dndm, m_outside_range = prepare_mf(mpart, grid, mf_kwargs)
 
-    halopos = place_halos(halomasses, grid, dm_pos)
+    # Take off the mass that we'll never populate.
+    grid -= m_outside_range
+    if VERBOSE:
+        print "ASSIGNING HALO MASSES"
+    halomasses, offsets = choose_halo_masses(cdf, icdf, mpart, grid, boxsize)
+
+    if MAKE_PLOTS:
+        hist, edges = np.histogram(np.log(halomasses), bins=20)
+        hist = hist.astype('float64')
+        hist /= (edges[1] - edges[0])
+        centres = (edges[:-1] + edges[1:]) / 2
+        plt.clf()
+        plt.scatter(np.exp(centres), hist)
+
+        plt.plot(10 ** M, 10 ** M * dndm * boxsize ** 3)
+        plt.yscale('log')
+        plt.xscale('log')
+        plt.savefig("dndm.pdf")
+
+    sys.exit("stopping here for now")
+    halopos = place_halos(halomasses, grid, dm_pos, offsets)
 
     return halopos
 
@@ -89,83 +130,120 @@ def _get_gadget(filename):
     for name in header.dtype.names:
         header_dict[name] = header[name][0]
 
-    return pos.view(np.float32).reshape(pos.shape + (-1,)) , header_dict['boxsize'], header_dict['massarr'][1]
+    return pos.view(np.float32).reshape(pos.shape + (-1,)) , header_dict
 
 
 def _make_grid(dm_pos, boxsize, cell_size):
     bins = int(boxsize / cell_size)
-    H, edges = np.histogramdd(dm_pos, bins)
-    # cell_assigned = np.array((dm_pos.shape[0], 3))
-    return H, edges
+    H = np.histogramdd(dm_pos, bins)[0]
+    cell_size = boxsize / bins
+    return H, cell_size
 
 def prepare_mf(mpart, grid, mf_kwargs):
-    # The maximum mass we will care about.
-    max_mass = grid.max() * mpart
+    M = np.linspace(np.log10(mpart), np.log10(grid.max()), 2000)
+    mf_obj = MassFunction(M=M, **mf_kwargs)
 
-    M = np.linspace(np.log10(mpart), np.log10(max_mass), 2000)
+    mf = mf_obj.dndm
+    m_outside_range = mf_obj.mltm[0] + mf_obj.mgtm[-1]
 
-    mf = MassFunction(M=M, **mf_kwargs).dndm
+    cumfunc = cumtrapz(10 ** M * mf, M, initial=0) * np.log(10)
 
-    cumfunc = cumtrapz(M, 10 ** M * mf)
+    cdf = spline(M, cumfunc, k=3)
+    icdf = spline(cumfunc, M, k=3)
 
-    cdf = spline(M, np.log10(cumfunc))
-    icdf = spline(np.log10(cumfunc), M)
+    if MAKE_PLOTS:
+        plt.clf()
+        plt.plot(M, cumfunc)
 
-    return cdf, icdf
+        plt.plot(M, cdf(M))
+        plt.savefig("cumfunc.pdf")
 
-def choose_halo_masses(cdf, icdf, mpart, grid):
+        plt.clf()
+        mcumfunc = cumtrapz(10 ** (2 * M) * mf, dx=M[1] - M[0], initial=1e-20) * np.log(10)
+        plt.plot(M, mcumfunc)
+        plt.savefig("mcumfunc.pdf")
 
-    tol = 2 * mpart
+        # How much mass is above 10**12.5
+        minvcumfunc = cumtrapz(10 ** (2 * M[::-1]) * mf[::-1], dx=M[1] - M[0]) * np.log(10)
+        minvcumfunc = np.concatenate((np.array([minvcumfunc[0]]), minvcumfunc))
+        minvcumfunc /= minvcumfunc[-1]
+        plt.clf()
+        plt.plot(M, minvcumfunc[::-1])
+        plt.yscale('log')
+        plt.grid(True)
+        plt.savefig("minvcumfunc.pdf")
+
+    return cdf, icdf, M, mf, m_outside_range
+
+def choose_halo_masses(cdf, icdf, mpart, grid, boxsize):
+
+    tol = 3 * mpart
     i = 0
-    masses = []
+    offsets = np.zeros(grid.size)
     for mcell in np.nditer(grid):
 
         if mcell < tol:
             print "Mass in cell ", i, " is negligible"
-            masses.append([])
             continue
 
-        diff = 3 * mpart
-        m_in_cell = mcell
+        diff = 4 * mpart
+        m_in_cell = mcell.copy()
         j = 0
 
+        if VERBOSE:
+            print "CELL: ", i
         while diff > tol:
+            # Figure out expected number of halos to get back mass in cell
             maxcum = cdf(np.log10(m_in_cell))
-            mean_halo_mass = 10 ** maxcum / (m_in_cell - mpart)
-            N_expected = 1.2 * m_in_cell / mean_halo_mass
-
+            # mean_halo_mass = 10 ** mcdf(np.log10(m_in_cell)) / (m_in_cell - mpart)
+            N_expected = int(maxcum * boxsize ** 3 / grid.size)
+            # Generate random variates from 0 to maxcum
             x = np.random.random(N_expected) * maxcum
-            m = icdf(x)
+
+            # Generate halo masses from mf distribution
+            m = 10 ** icdf(x)
+
+            # Make sure we don't have more or less mass than needed
             cumsum = np.cumsum(m)
-            cross_ind = np.where(cumsum > m_in_cell)[0]
+            try:
+                cross_ind = np.where(cumsum > m_in_cell)[0][0]
+            except IndexError:
+                cross_ind = len(cumsum) - 1
+
+            if VERBOSE:
+                print "  ITERATION: ", j, "Num. Vars: ", len(cumsum), ", Final # Halos: ", cross_ind + 1
             over = abs(cumsum[cross_ind] - m_in_cell)
             under = abs(cumsum[cross_ind - 1] - m_in_cell)
             if over < tol and under < tol:
                 if over < under:
-                    m = m[:cross_ind - 1]
+                    m = m[:cross_ind ]
                 else:
-                    m = m[:cross_ind]
+                    m = m[:cross_ind + 1]
                 diff = over
             elif over < tol:
-                m = m[:cross_ind]
+                m = m[:cross_ind + 1]
                 diff = over
             else:
-                m = m[:cross_ind - 1]
+                m = m[:cross_ind]
                 diff = under
                 m_in_cell -= cumsum[cross_ind - 1]
 
-            if j > 0:
-                cell_masses = np.concatenate((cell_masses, m))
-            else:
+            # Save the halo masses in this cell (perhaps append them)
+            if i == 0 and j == 0:
                 cell_masses = m
+            else:
+                cell_masses = np.concatenate((cell_masses, m))
+
             j += 1
 
-        masses.append(cell_masses)
+        cell_masses[offsets[i]:] = np.sort(cell_masses[offsets[i]:])[::-1]
+        if i < grid.size - 1:
+            offsets[i + 1] = len(cell_masses)
         i += 1
 
-    return masses
+    return cell_masses, offsets
 
-def place_halos(halomasses, grid, dm_pos,edges):
-    
+def place_halos(halomasses, grid, dm_pos, edges):
+
     for cell in halomasses:
-        
+        pass
